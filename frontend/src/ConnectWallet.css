@@ -1,0 +1,71 @@
+.connect-hero {
+  position: relative;
+  min-height: 100vh;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+.connect-hero__overlay {
+  position: absolute;
+  inset: 0;
+  /* lớp phủ để text nổi bật + hơi giống tone ảnh bạn gửi */
+  background: linear-gradient(
+    90deg,
+    rgba(215, 235, 250, 0.92) 0%,
+    rgba(215, 235, 250, 0.75) 45%,
+    rgba(215, 235, 250, 0.25) 100%
+  );
+}
+
+.connect-hero__container {
+  position: relative;
+  z-index: 1;
+  padding-top: 32px;
+  padding-bottom: 32px;
+}
+
+.connect-hero__error {
+  margin-bottom: 16px;
+}
+
+.connect-hero__title {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(36px, 4.2vw, 64px);
+  font-weight: 500;
+  letter-spacing: -0.5px;
+  color: #1b2430;
+  margin-bottom: 14px;
+}
+
+.connect-hero__subtitle {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(18px, 2vw, 28px);
+  line-height: 1.3;
+  color: #1b2430;
+  margin-bottom: 20px;
+  max-width: 520px;
+}
+
+.connect-hero__bullets {
+  margin: 0 0 22px 0;
+  padding-left: 18px;
+  color: #1b2430;
+  max-width: 520px;
+}
+
+.connect-hero__bullets li {
+  margin-bottom: 6px;
+}
+
+.connect-hero__cta {
+  padding: 14px 28px;
+  border-radius: 8px;
+  font-weight: 600;
+}
+
+.connect-hero__hint {
+  margin-top: 10px;
+  font-size: 13px;
+  color: rgba(27, 36, 48, 0.75);
+}
