@@ -149,7 +149,7 @@ const Borrower = () => {
 
   const tryGetAssetMeta = async (tokenId) => {
     // Works if TokenNFT has assetNameOf/assetTypeOf; otherwise fallback.
-    let name = `Token #${tokenId}`;
+    let name = `Token ${tokenId}`;
     let type = 0;
     if (!nftContract) return { id: Number(tokenId), type, name };
 
@@ -445,7 +445,7 @@ const Borrower = () => {
 
           <div className="mt-2">
             <strong>Owned tokenIds:</strong>{" "}
-            {ownedTokenMeta.length ? ownedTokenMeta.map((x) => `${x.id} - ${x.name}`).join(", ") : "None"}
+            {ownedTokenMeta.length ? ownedTokenIds.map((id) => `Token ${id}`).join(", ") : "None"}
           </div>
 
           <Row className="mt-3">
@@ -460,17 +460,17 @@ const Borrower = () => {
                 <option value="2">Car</option>
                 <option value="3">Motorbike</option>
                 <option value="4">House</option>
-                <option value="5">Land</option>
+                <option value="5">Land plot</option>
                 <option value="6">Watch</option>
                 <option value="7">Jewelry</option>
-                <option value="8">National ID (demo)</option>
+                <option value="8">National ID</option>
                 <option value="9">Other</option>
               </Form.Select>
             </Col>
             <Col md={5}>
               <Form.Control
                 className="mb-2"
-                placeholder='e.g., "Gold - 1oz bar (demo)"'
+                placeholder='e.g., "Gold - 1oz bar"'
                 value={mintForm.assetName}
                 onChange={(e) => setMintForm((p) => ({ ...p, assetName: e.target.value }))}
               />
@@ -541,7 +541,7 @@ const Borrower = () => {
                 ) : (
                   ownedTokenMeta.map((x) => (
                     <option key={x.id} value={x.id}>
-                      {x.id} - {x.name}
+                      {x.name}
                     </option>
                   ))
                 )}
