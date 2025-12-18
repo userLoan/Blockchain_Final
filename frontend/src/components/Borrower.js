@@ -1,3 +1,4 @@
+// frontend/src/components/Borrower.js
 import React, { useEffect, useMemo, useState } from "react";
 import { Container, Row, Col, Form, Button, Table, Card, Badge, Toast } from "react-bootstrap";
 import { ethers } from "ethers";
@@ -10,21 +11,75 @@ import addresses from "../contracts/contract-address.json";
 const LENDING_ADDRESS = addresses.LendingPlatform || addresses.lendingPlatformAddress;
 const NFT_ADDRESS = addresses.TokenNFT || addresses.tokenNftAddress;
 
-const STATUS = {
-  NONE: 0,
-  ACTIVE: 1,
-  FUNDED: 2,
-  CANCELLED: 3,
-  EXPIRED: 4,
+// -------- helpers (avoid BigNumber undefined crashes) --------
+const toInt = (v, fallback = 0) => {
+  if (v === null || v === undefined) return fallback;
+  try {
+    if (typeof v === "number") return v;
+    if (typeof v === "bigint") return Number(v);
+    if (typeof v === "string") return Number(v);
+    if (v.toNumber) return v.toNumber();
+    if (v.toString) return Number(v.toString());
+  } catch (_) {}
+  return fallback;
 };
+
+const tuple = (res, key, idx, fb) => (res ? (res[key] ?? res[idx] ?? fb) : fb);
+// ---------------- Asset naming (UI-only) ----------------
+// We KEEP mint() unchanged. Custom names are stored in browser localStorage.
+// If you need names on-chain (portable across devices), we must add a mintWithName() in the NFT contract.
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+// Default mapping (you can edit freely)
+const DEFAULT_ASSET_BY_TOKEN_ID = {
+  1: "Gold",
+  2: "Silver",
+  3: "Car",
+  4: "Motorbike",
+  5: "House",
+};
+
+function storageKey(chainId, nftAddress) {
+  const cid = chainId ?? "unknown";
+  return `dloan_nft_names_${cid}_${String(nftAddress || "").toLowerCase()}`;
+}
+
+function safeJsonParse(s, fallback) {
+  try { return JSON.parse(s); } catch (_) { return fallback; }
+}
+
+function loadNameMap(chainId, nftAddress) {
+  if (!nftAddress) return {};
+  const key = storageKey(chainId, nftAddress);
+  return safeJsonParse(window.localStorage.getItem(key) || "{}", {});
+}
+
+function saveTokenName(chainId, nftAddress, tokenId, name) {
+  if (!nftAddress || tokenId == null) return;
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return;
+
+  const key = storageKey(chainId, nftAddress);
+  const map = loadNameMap(chainId, nftAddress);
+  map[String(tokenId)] = trimmed;
+  window.localStorage.setItem(key, JSON.stringify(map));
+}
+
+function tokenDisplayName(chainId, nftAddress, tokenId) {
+  const id = Number(tokenId);
+  const map = loadNameMap(chainId, nftAddress);
+  return map[String(tokenId)] || DEFAULT_ASSET_BY_TOKEN_ID[id] || `Token ${id}`;
+}
 
 function extractRevertReason(err) {
   const data = err?.error?.data || err?.data || err?.error?.error?.data;
   const msg = err?.error?.message || err?.message || "";
 
+  // Ethers v5: "execution reverted: <reason>"
   const m1 = msg.match(/reverted(?: with reason string)?(?::| )['"]?([^'"]+)['"]?/i);
   if (m1?.[1]) return m1[1];
 
+  // Ethers v5: sometimes nested body JSON
   try {
     const body = err?.error?.body;
     if (typeof body === "string") {
@@ -34,6 +89,7 @@ function extractRevertReason(err) {
     }
   } catch (_) {}
 
+  // Try to decode Error(string)
   if (data && typeof data === "string" && data.startsWith("0x08c379a0")) {
     try {
       const reason = ethers.utils.defaultAbiCoder.decode(["string"], "0x" + data.slice(10))[0];
@@ -45,36 +101,35 @@ function extractRevertReason(err) {
 }
 
 async function getOwnedTokenIds(nft, owner) {
+  // Demo approach: scan tokenIds from 1..nextTokenId-1 and collect those owned by `owner`
   const owned = [];
   let nextId = 1;
-
   try {
-    nextId = (await nft.nextTokenId()).toNumber();
+    nextId = toInt(await nft.nextTokenId());
   } catch (_) {
+    // fallback
     nextId = 1;
   }
-
   for (let id = 1; id < nextId; id++) {
     try {
       const o = await nft.ownerOf(id);
       if (o && o.toLowerCase() === owner.toLowerCase()) owned.push(id);
-    } catch (_) {}
+    } catch (_) {
+      // tokenId may not exist
+    }
   }
   return owned;
 }
-
-const toNum = (v) => {
-  const n = Number((v ?? "").toString().trim());
-  return Number.isFinite(n) ? n : 0;
-};
 
 const Borrower = () => {
   const [account, setAccount] = useState("");
   const [ethBalance, setEthBalance] = useState("");
   const [nftCount, setNftCount] = useState(0);
-
   const [ownedTokenIds, setOwnedTokenIds] = useState([]);
-  const [ownedTokenMeta, setOwnedTokenMeta] = useState([]); // [{id,type,name}]
+
+  const [chainId, setChainId] = useState(null);
+  const [mintName, setMintName] = useState("");
+  const [nameVersion, setNameVersion] = useState(0);
 
   const [lendingContract, setLendingContract] = useState(null);
   const [nftContract, setNftContract] = useState(null);
@@ -82,15 +137,6 @@ const Borrower = () => {
   const [myRequests, setMyRequests] = useState([]);
   const [myActiveLoans, setMyActiveLoans] = useState([]);
 
-  const [autoExpireBusy, setAutoExpireBusy] = useState(false);
-
-  const [toast, setToast] = useState({ show: false, message: "", variant: "success" });
-  const showToast = (message, variant = "success") => setToast({ show: true, message, variant });
-
-  // Mint form (optional demo metadata)
-  const [mintForm, setMintForm] = useState({ assetType: "0", assetName: "" });
-
-  // Create loan request form
   const [formData, setFormData] = useState({
     amount: "",
     interestRate: "",
@@ -98,10 +144,8 @@ const Borrower = () => {
     tokenId: "",
   });
 
-  const amountEth = toNum(formData.amount);
-  const ratePct = toNum(formData.interestRate);
-  const interestEth = amountEth > 0 && ratePct > 0 ? (amountEth * ratePct) / 100 : 0;
-  const totalRepayEth = amountEth > 0 ? amountEth + interestEth : 0;
+  const [toast, setToast] = useState({ show: false, message: "", variant: "success" });
+  const showToast = (message, variant = "success") => setToast({ show: true, message, variant });
 
   const provider = useMemo(() => {
     if (!window.ethereum) return null;
@@ -112,15 +156,10 @@ const Borrower = () => {
     const init = async () => {
       if (!provider) return;
 
-      // Ensure wallet connected
-      const accs = await provider.listAccounts();
-      if (!accs || accs.length === 0) {
-        try {
-          await provider.send("eth_requestAccounts", []);
-        } catch (_) {
-          return;
-        }
-      }
+      try {
+        const network = await provider.getNetwork();
+        setChainId(network.chainId);
+      } catch (_) {}
 
       const accounts = await provider.listAccounts();
       if (!accounts || accounts.length === 0) return;
@@ -129,6 +168,7 @@ const Borrower = () => {
       setAccount(addr);
 
       const signer = provider.getSigner();
+
       setLendingContract(new ethers.Contract(LENDING_ADDRESS, LendingPlatformABI, signer));
       setNftContract(new ethers.Contract(NFT_ADDRESS, TokenNFTABI, signer));
     };
@@ -137,49 +177,19 @@ const Borrower = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider]);
 
-  const nowTs = async () => {
-    if (!provider) return Math.floor(Date.now() / 1000);
-    try {
-      const b = await provider.getBlock("latest");
-      return Number(b.timestamp);
-    } catch {
-      return Math.floor(Date.now() / 1000);
-    }
-  };
-
-  const tryGetAssetMeta = async (tokenId) => {
-    // Works if TokenNFT has assetNameOf/assetTypeOf; otherwise fallback.
-    let name = `Token ${tokenId}`;
-    let type = 0;
-    if (!nftContract) return { id: Number(tokenId), type, name };
-
-    try {
-      if (nftContract.assetNameOf) name = await nftContract.assetNameOf(tokenId);
-    } catch (_) {}
-    try {
-      if (nftContract.assetTypeOf) type = (await nftContract.assetTypeOf(tokenId)).toNumber();
-    } catch (_) {}
-
-    return { id: Number(tokenId), type, name };
-  };
-
   const updateBalances = async () => {
     if (!provider || !nftContract || !account) return;
-
     const bal = await provider.getBalance(account);
     setEthBalance(ethers.utils.formatEther(bal));
 
     const c = await nftContract.balanceOf(account);
-    setNftCount(c.toNumber());
+    setNftCount(toInt(c));
 
     const ids = await getOwnedTokenIds(nftContract, account);
     setOwnedTokenIds(ids);
 
-    // enrich meta
-    const meta = await Promise.all(ids.map((id) => tryGetAssetMeta(id)));
-    setOwnedTokenMeta(meta);
-
-    // keep tokenId in form valid
+    // If user hasn't selected a tokenId yet (or selected one they don't own),
+    // default to the first owned tokenId to avoid accidental reverts.
     setFormData((prev) => {
       const current = (prev.tokenId ?? "").toString().trim();
       const currentNum = Number(current);
@@ -190,86 +200,67 @@ const Borrower = () => {
     });
   };
 
-  const loadMyData = async (skipAuto = false) => {
+  const loadMyData = async () => {
     if (!lendingContract || !account) return;
-
-    const chainNow = await nowTs();
 
     // Borrower requests
     const res = await lendingContract.getBorrowerRequests(account);
-    const requestIds = res[0];
-    const requests = res[1];
+    const requestIds = tuple(res, 'requestIds', 0, []);
+    const requests = tuple(res, 'requests', 1, []);
 
-    const expiry = await lendingContract.REQUEST_EXPIRY();
-    const createdArr = await Promise.all(requestIds.map((id) => lendingContract.requestCreatedAt(id)));
-    const statusArr = await Promise.all(requestIds.map((id) => lendingContract.requestStatus(id)));
-
-    const mappedReq = requests.map((r, i) => {
-      const requestId = requestIds[i].toNumber();
-      const createdAt = Number(createdArr[i]);
-      const statusCode = Number(statusArr[i]);
-      const expiresAt = createdAt > 0 ? createdAt + Number(expiry) : 0;
-      const expiredByTime = statusCode === STATUS.ACTIVE && createdAt > 0 && chainNow > expiresAt;
-
-      return {
-        requestId,
-        borrower: r.borrower,
-        loanAmountWei: r.loanAmount,
-        loanAmount: ethers.utils.formatEther(r.loanAmount),
-        duration: r.durationInDays ? r.durationInDays.toNumber() : r.duration?.toNumber?.() ?? 0,
-        interestRate: r.interestRate.toNumber(),
-        isActive: r.isActive,
-        collateralTokenId: r.collateralTokenId.toNumber(),
-        statusCode,
-        createdAt,
-        expiresAt,
-        expiredByTime,
-      };
-    });
-
-    // Active loans (filter by borrower)
-    const allActive = await lendingContract.getAllActive();
-    const loanIds = allActive[0];
-    const loans = allActive[1];
-
-    const mappedLoans = loans
-      .map((l, i) => ({
-        loanId: loanIds[i].toNumber(),
-        borrower: l.borrower,
-        lender: l.lender,
-        loanAmountWei: l.loanAmount,
-        loanAmount: ethers.utils.formatEther(l.loanAmount),
-        endTime: l.endTime.toNumber(),
-        interestRate: l.interestRate.toNumber(),
-        collateralTokenId: l.collateralTokenId.toNumber(),
-      }))
-      .filter((x) => x.borrower?.toLowerCase() === account.toLowerCase());
-
+    const mappedReq = (requests || [])
+      .map((r, i) => {
+        const rid = (requestIds || [])[i];
+        if (!rid || !r) return null;
+        return {
+          requestId: toInt(rid),
+          borrower: r.borrower,
+          loanAmount: ethers.utils.formatEther(r.loanAmount),
+          duration: toInt(r.duration),
+          interestRate: toInt(r.interestRate),
+          isActive: r.isActive,
+          collateralTokenId: toInt(r.collateralTokenId),
+        };
+      })
+      .filter(Boolean);
     setMyRequests(mappedReq);
-    setMyActiveLoans(mappedLoans);
 
-    // Auto-expire: if ACTIVE + expiredByTime => call expireLoanRequest to return NFT
-    if (!skipAuto && !autoExpireBusy) {
-      const target = mappedReq.find((x) => x.isActive && x.statusCode === STATUS.ACTIVE && x.expiredByTime);
-      if (target) {
-        setAutoExpireBusy(true);
-        try {
-          const tx = await lendingContract.expireLoanRequest(target.requestId);
-          await tx.wait();
-          showToast(`Request #${target.requestId} was not funded in 2 days. NFT returned to you.`, "success");
-        } catch (e) {
-          // If user rejects / revert, keep UI stable; manual button still exists.
-          console.error(e);
-          showToast(extractRevertReason(e), "danger");
-        } finally {
-          setAutoExpireBusy(false);
-        }
-
-        await updateBalances();
-        await loadMyData(true); // refresh UI after finalizing expiry
-        return;
-      }
+    // Active loans: scan all active loans and filter by borrower (demo)
+    // Chain time (IMPORTANT): Hardhat time travel only affects block.timestamp.
+    // So we use latest block timestamp to decide whether a loan is expired.
+    let chainNow = Math.floor(Date.now() / 1000);
+    try {
+      const latestBlock = await provider.getBlock("latest");
+      if (latestBlock?.timestamp) chainNow = latestBlock.timestamp;
+    } catch (e) {
+      // fallback to local time
     }
+
+    const all = await lendingContract.getAllActive();
+    const loanIds = tuple(all, 'loanIds', 0, []);
+    const loans = tuple(all, 'loans', 1, []);
+
+    const mappedLoans = (loans || [])
+      .map((l, i) => {
+        const lid = (loanIds || [])[i];
+        if (!lid || !l) return null;
+        const end = toInt(l.endTime);
+        return {
+          loanId: toInt(lid),
+          borrower: l.borrower,
+          lender: l.lender,
+          loanAmount: ethers.utils.formatEther(l.loanAmount),
+          endTime: end,
+          isExpired: chainNow > end,
+          chainNow,
+          interestRate: toInt(l.interestRate),
+          collateralTokenId: toInt(l.collateralTokenId),
+        };
+      })
+      .filter(Boolean)
+      .filter((x) => (x?.borrower || "").toLowerCase() === account.toLowerCase());
+
+    setMyActiveLoans(mappedLoans);
   };
 
   useEffect(() => {
@@ -281,47 +272,79 @@ const Borrower = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account, lendingContract, nftContract]);
 
+  const handleInputChange = (e) => {
+    const { name, value } = e.target;
+    setFormData((p) => ({ ...p, [name]: value }));
+  };
+
   const mintNft = async () => {
     if (!nftContract) return;
     try {
-      // Try mint(assetType, assetName) first; fallback to mint()
-      let tx;
+      const tx = await nftContract.mint(); // KEEP the mint() flow unchanged
+      const receipt = await tx.wait();
+
+      // Try to extract tokenId from the ERC721 Transfer(0x0 -> account) event
+      let mintedTokenId = null;
       try {
-        tx = await nftContract.mint(Number(mintForm.assetType), mintForm.assetName || "");
-      } catch (_) {
-        tx = await nftContract.mint();
+        const ev = receipt?.events?.find(
+          (e) =>
+            e?.event === "Transfer" &&
+            e?.args &&
+            String(e.args.from).toLowerCase() === ZERO_ADDRESS &&
+            String(e.args.to).toLowerCase() === String(account).toLowerCase()
+        );
+        mintedTokenId = ev?.args?.tokenId != null ? ev.args.tokenId.toString() : null;
+      } catch (_) {}
+
+      // Fallback if event seen is missing (some providers omit decoded events)
+      if (mintedTokenId == null) {
+        try {
+          const next = await nftContract.nextTokenId();
+          mintedTokenId = next.sub(1).toString();
+        } catch (_) {}
       }
-      await tx.wait();
-      showToast("Minted a new NFT successfully", "success");
+
+      // Save custom name (UI-only) if user entered it
+      const custom = (mintName || "").trim();
+      if (custom && mintedTokenId != null) {
+        saveTokenName(chainId, NFT_ADDRESS, mintedTokenId, custom);
+        setMintName("");
+        setNameVersion((v) => v + 1);
+      }
+
       await updateBalances();
-      await loadMyData();
+      showToast(
+        mintedTokenId ? `Minted NFT #${mintedTokenId}${custom ? ` (${custom})` : ""} successfully` : "Minted a new NFT successfully",
+        "success"
+      );
     } catch (e) {
       console.error(e);
       showToast(extractRevertReason(e), "danger");
     }
   };
 
-  const createRequest = async () => {
+  const createLoanRequest = async (e) => {
+    e.preventDefault();
     if (!lendingContract || !nftContract) return;
 
     try {
-      const amountEthNum = toNum(formData.amount);
-      const duration = toNum(formData.duration);
-      const interest = toNum(formData.interestRate);
-      const tokenId = toNum(formData.tokenId);
+      const amountWei = ethers.utils.parseEther(formData.amount || "0");
+      const duration = ethers.BigNumber.from(formData.duration || "0");
+      const interest = ethers.BigNumber.from(formData.interestRate || "0");
+      const tokenId = parseInt(formData.tokenId || "0", 10);
 
-      if (amountEthNum <= 0) return showToast("Amount must be > 0", "danger");
-      if (duration <= 0) return showToast("Duration must be > 0", "danger");
-      if (interest <= 0 || interest > 7) return showToast("Interest rate must be 1..7", "danger");
-      if (!tokenId) return showToast("Select a collateral tokenId", "danger");
+      if (amountWei.lte(0)) return showToast("Loan amount must be > 0", "warning");
+      if (duration.lte(0)) return showToast("Duration must be > 0", "warning");
+      if (interest.lte(0)) return showToast("Interest rate must be > 0", "warning");
+      if (!tokenId || tokenId <= 0) return showToast("Please enter a valid NFT tokenId", "warning");
 
-      // Ownership check
+      // UI check: must own tokenId
       const owner = await nftContract.ownerOf(tokenId);
       if (owner.toLowerCase() !== account.toLowerCase()) {
         return showToast(`You do not own this NFT tokenId. Owned: ${ownedTokenIds.join(", ") || "-"}`, "danger");
       }
 
-      // Ensure approval
+      // Approve platform for this tokenId if needed
       const approved = await nftContract.getApproved(tokenId);
       const isAll = await nftContract.isApprovedForAll(account, LENDING_ADDRESS);
       if (!isAll && approved.toLowerCase() !== LENDING_ADDRESS.toLowerCase()) {
@@ -329,13 +352,11 @@ const Borrower = () => {
         await approveTx.wait();
       }
 
-      const amountWei = ethers.utils.parseEther(String(amountEthNum));
       const tx = await lendingContract.createLoanRequest(amountWei, duration, interest, tokenId);
       await tx.wait();
 
-      showToast("Loan request created successfully (NFT escrowed).", "success");
-      setFormData((p) => ({ ...p, amount: "" }));
-
+      showToast("Loan request created successfully", "success");
+      setFormData((p) => ({ ...p, amount: "", tokenId: "" }));
       await updateBalances();
       await loadMyData();
     } catch (e2) {
@@ -358,22 +379,9 @@ const Borrower = () => {
     }
   };
 
-  const manualExpire = async (requestId) => {
-    if (!lendingContract) return;
-    try {
-      const tx = await lendingContract.expireLoanRequest(requestId);
-      await tx.wait();
-      showToast("Request not funded in 2 days. NFT returned to you.", "success");
-      await updateBalances();
-      await loadMyData();
-    } catch (e) {
-      console.error(e);
-      showToast(extractRevertReason(e), "danger");
-    }
-  };
-
   const repayLoan = async (loanId) => {
     if (!lendingContract) return;
+
     try {
       const required = await lendingContract.getRepayAmount(loanId);
       const tx = await lendingContract.repayLoan(loanId, { value: required });
@@ -387,183 +395,127 @@ const Borrower = () => {
     }
   };
 
-  const renderReqStatus = (r) => {
-    // Borrower requirement: nếu không fund trong 2 ngày => "UNFUNDED"
-    if ((r.statusCode === STATUS.ACTIVE && r.expiredByTime) || r.statusCode === STATUS.EXPIRED) {
-      return (
-        <Badge bg="warning" text="dark">
-          UNFUNDED
-        </Badge>
-      );
-    }
-    if (r.statusCode === STATUS.ACTIVE) return <Badge bg="success">ACTIVE</Badge>;
-    if (r.statusCode === STATUS.FUNDED) return <Badge bg="info">FUNDED</Badge>;
-    if (r.statusCode === STATUS.CANCELLED) return <Badge bg="secondary">CANCELLED</Badge>;
-    return <Badge bg="secondary">UNKNOWN</Badge>;
-  };
-
-  const renderReqAction = (r) => {
-    // If expiredByTime, UI will auto-trigger; keep manual fallback button
-    if (r.statusCode === STATUS.ACTIVE && r.expiredByTime) {
-      return (
-        <Button
-          variant="outline-warning"
-          size="sm"
-          disabled={autoExpireBusy}
-          onClick={() => manualExpire(r.requestId)}
-        >
-          Return NFT
-        </Button>
-      );
-    }
-    if (r.statusCode === STATUS.ACTIVE && !r.expiredByTime) {
-      return (
-        <Button variant="danger" size="sm" onClick={() => cancelRequest(r.requestId)}>
-          Cancel
-        </Button>
-      );
-    }
-    return "-";
-  };
-
-  const renderTokenLabel = (tokenId) => {
-    const m = ownedTokenMeta.find((x) => Number(x.id) === Number(tokenId));
-    if (m) return `${tokenId} - ${m.name}`;
-    return String(tokenId);
-  };
-
   return (
     <Container className="py-4">
       <Card className="mb-4">
-        <Card.Header>
-          <strong>Borrower Dashboard</strong>
-        </Card.Header>
+        <Card.Header><strong>Borrower Dashboard</strong></Card.Header>
         <Card.Body>
           <div><strong>Account:</strong> {account}</div>
           <div className="mt-2"><strong>ETH Balance:</strong> {ethBalance} ETH</div>
           <div className="mt-2"><strong>NFT Balance:</strong> {nftCount} TokenNFT</div>
-
           <div className="mt-2">
-            <strong>Owned tokenIds:</strong>{" "}
-            {ownedTokenMeta.length ? ownedTokenIds.map((id) => `Token ${id}`).join(", ") : "None"}
+            <strong>Owned NFTs:</strong> {ownedTokenIds.length ? ownedTokenIds.map((id) => `${tokenDisplayName(chainId, NFT_ADDRESS, id)}`).join(", ") : "None"}
           </div>
-
-          <Row className="mt-3">
-            <Col md={4}>
-              <Form.Select
-                className="mb-2"
-                value={mintForm.assetType}
-                onChange={(e) => setMintForm((p) => ({ ...p, assetType: e.target.value }))}
-              >
-                <option value="0">Gold</option>
-                <option value="1">Silver</option>
-                <option value="2">Car</option>
-                <option value="3">Motorbike</option>
-                <option value="4">House</option>
-                <option value="5">Land plot</option>
-                <option value="6">Watch</option>
-                <option value="7">Jewelry</option>
-                <option value="8">National ID</option>
-                <option value="9">Other</option>
-              </Form.Select>
-            </Col>
-            <Col md={5}>
+          <div className="mt-3">
+            <Form.Group className="mb-2">
+              <Form.Label>Custom NFT name (optional)</Form.Label>
               <Form.Control
-                className="mb-2"
-                placeholder='e.g., "Gold - 1oz bar"'
-                value={mintForm.assetName}
-                onChange={(e) => setMintForm((p) => ({ ...p, assetName: e.target.value }))}
+                type="text"
+                placeholder='e.g., "Gold", "House", "Car"'
+                value={mintName}
+                onChange={(e) => setMintName(e.target.value)}
               />
-            </Col>
-            <Col md={3}>
-              <Button variant="secondary" onClick={mintNft} className="w-100">
-                Mint NFT
-              </Button>
-            </Col>
-          </Row>
+            </Form.Group>
+            <Button variant="secondary" onClick={mintNft}>Mint NFT</Button>{" "}
+          </div>
         </Card.Body>
       </Card>
 
       <Card className="mb-4">
         <Card.Header><strong>Create Loan Request</strong></Card.Header>
         <Card.Body>
-          <Row className="mb-3">
-            <Col md={4}><Form.Label>Amount (ETH)</Form.Label></Col>
-            <Col md={8}>
-              <Form.Control
-                placeholder="Enter loan amount in ETH"
-                value={formData.amount}
-                onChange={(e) => setFormData((p) => ({ ...p, amount: e.target.value }))}
-              />
-            </Col>
-          </Row>
+          <Form onSubmit={createLoanRequest}>
+            <Form.Group as={Row} className="mb-3">
+              <Form.Label column sm={3}>Amount (ETH)</Form.Label>
+              <Col sm={9}>
+                <Form.Control
+                  name="amount"
+                  value={formData.amount}
+                  onChange={handleInputChange}
+                  placeholder="Enter loan amount in ETH"
+                />
+              </Col>
+            </Form.Group>
 
-          <Row className="mb-3">
-            <Col md={4}><Form.Label>Interest Rate (%)</Form.Label></Col>
-            <Col md={8}>
-              <Form.Control
-                placeholder="Enter interest rate (max 7)"
-                value={formData.interestRate}
-                onChange={(e) => setFormData((p) => ({ ...p, interestRate: e.target.value }))}
-              />
-              <div className="text-muted mt-1" style={{ fontSize: 13 }}>
-                Maximum interest rate allowed is {7}%
-              </div>
-              <div className="text-muted mt-1" style={{ fontSize: 13 }}>
-                Interest: {interestEth > 0 ? interestEth.toFixed(6) : "0"} ETH
-              </div>
-              <div className="text-muted" style={{ fontSize: 13 }}>
-                Total to repay: {totalRepayEth > 0 ? totalRepayEth.toFixed(6) : "0"} ETH
-              </div>
-            </Col>
-          </Row>
+            <Form.Group as={Row} className="mb-3">
+              <Form.Label column sm={3}>Interest Rate (%)</Form.Label>
+              <Col sm={9}>
+                <Form.Control
+                  name="interestRate"
+                  value={formData.interestRate}
+                  onChange={handleInputChange}
+                  placeholder="Enter interest rate (max 7)"
+                />
+                <div className="text-muted mt-1" style={{ fontSize: 13 }}>
+                  Maximum interest rate allowed is {7}%
+                </div>
+              </Col>
+            </Form.Group>
 
-          <Row className="mb-3">
-            <Col md={4}><Form.Label>Duration (days)</Form.Label></Col>
-            <Col md={8}>
-              <Form.Control
-                placeholder="Enter duration in days"
-                value={formData.duration}
-                onChange={(e) => setFormData((p) => ({ ...p, duration: e.target.value }))}
-              />
-            </Col>
-          </Row>
+            <Form.Group as={Row} className="mb-3">
+              <Form.Label column sm={3}>Duration (days)</Form.Label>
+              <Col sm={9}>
+                <Form.Control
+                  name="duration"
+                  value={formData.duration}
+                  onChange={handleInputChange}
+                  placeholder="Enter duration in days"
+                />
+              </Col>
+            </Form.Group>
 
-          <Row className="mb-3">
-            <Col md={4}><Form.Label>Collateral (NFT tokenId)</Form.Label></Col>
-            <Col md={8}>
-              <Form.Select
-                value={formData.tokenId}
-                onChange={(e) => setFormData((p) => ({ ...p, tokenId: e.target.value }))}
-              >
-                {ownedTokenMeta.length === 0 ? (
-                  <option value="">No NFTs owned</option>
+            <Form.Group as={Row} className="mb-3">
+              <Form.Label column sm={3}>Collateral (NFT)</Form.Label>
+              <Col sm={9}>
+                {ownedTokenIds.length > 0 ? (
+                  <>
+                    <Form.Select
+                      name="tokenId"
+                      value={formData.tokenId}
+                      onChange={handleInputChange}
+                    >
+                      {ownedTokenIds.map((id) => (
+                        <option key={id} value={id}>
+                          {tokenDisplayName(chainId, NFT_ADDRESS, id)}
+                        </option>
+                      ))}
+                    </Form.Select>
+
+                    <Form.Text muted>
+                      Owned NFTs:{" "}
+                      {ownedTokenIds
+                        .map((id) => `${tokenDisplayName(chainId, NFT_ADDRESS, id)}`)
+                        .join(", ")}
+                    </Form.Text>
+                  </>
                 ) : (
-                  ownedTokenMeta.map((x) => (
-                    <option key={x.id} value={x.id}>
-                      {x.name}
-                    </option>
-                  ))
+                  <>
+                    <Form.Control
+                      type="number"
+                      name="tokenId"
+                      placeholder="Mint or enter a tokenId you own"
+                      value={formData.tokenId}
+                      onChange={handleInputChange}
+                    />
+                    <Form.Text muted>
+                      The NFT will be escrowed in the contract until you repay (or liquidated on expiry).
+                    </Form.Text>
+                  </>
                 )}
-              </Form.Select>
-              <div className="text-muted mt-1" style={{ fontSize: 13 }}>
-                Select a tokenId you own. Owned tokenIds: {ownedTokenIds.length ? ownedTokenIds.join(", ") : "None"}
-              </div>
-            </Col>
-          </Row>
+              </Col>
+            </Form.Group>
 
-          <Button onClick={createRequest}>Create Loan</Button>
+            <Button type="submit">Create Loan</Button>
+          </Form>
         </Card.Body>
       </Card>
 
       <Card className="mb-4">
-        <Card.Header><strong>Your Requests</strong></Card.Header>
+        <Card.Header className="d-flex justify-content-between align-items-center">
+          <strong>Your Requests</strong>
+        </Card.Header>
         <Card.Body>
-          <Button variant="outline-primary" size="sm" className="mb-2" onClick={loadMyData}>
-            Refresh
-          </Button>
-
-          <Table bordered hover>
+          <Table bordered hover responsive>
             <thead>
               <tr>
                 <th>Request ID</th>
@@ -576,64 +528,70 @@ const Borrower = () => {
               </tr>
             </thead>
             <tbody>
-              {myRequests.length === 0 ? (
-                <tr><td colSpan="7">No requests yet.</td></tr>
-              ) : (
-                myRequests.map((r) => (
-                  <tr key={r.requestId}>
-                    <td>{r.requestId}</td>
-                    <td>{r.loanAmount}</td>
-                    <td>{r.duration}</td>
-                    <td>{r.interestRate}%</td>
-                    <td>{renderTokenLabel(r.collateralTokenId)}</td>
-                    <td>{renderReqStatus(r)}</td>
-                    <td>{renderReqAction(r)}</td>
-                  </tr>
-                ))
+              {myRequests.map((r) => (
+                <tr key={r.requestId}>
+                  <td>{r.requestId}</td>
+                  <td>{r.loanAmount}</td>
+                  <td>{r.duration}</td>
+                  <td>{r.interestRate}%</td>
+                  <td>{r.collateralTokenId ? tokenDisplayName(chainId, NFT_ADDRESS, r.collateralTokenId) : "N/A"}</td>
+                  <td>
+                    {r.isActive ? <Badge bg="success">ACTIVE</Badge> : <Badge bg="secondary">INACTIVE</Badge>}
+                  </td>
+                  <td>
+                    {r.isActive ? (
+                      <Button variant="danger" size="sm" onClick={() => cancelRequest(r.requestId)}>
+                        Cancel
+                      </Button>
+                    ) : (
+                      "-"
+                    )}
+                  </td>
+                </tr>
+              ))}
+              {myRequests.length === 0 && (
+                <tr><td colSpan={7} className="text-center">No requests</td></tr>
               )}
             </tbody>
           </Table>
         </Card.Body>
       </Card>
 
-      <Card className="mb-4">
-        <Card.Header><strong>Your Active Loans</strong></Card.Header>
+      <Card>
+        <Card.Header className="d-flex justify-content-between align-items-center">
+          <strong>Your Active Loans</strong>
+        </Card.Header>
         <Card.Body>
-          <Button variant="outline-primary" size="sm" className="mb-2" onClick={loadMyData}>
-            Refresh
-          </Button>
-
-          <Table bordered hover>
+          <Table bordered hover responsive>
             <thead>
               <tr>
                 <th>Loan ID</th>
-                <th>Lender</th>
                 <th>Amount (ETH)</th>
                 <th>Interest</th>
-                <th>End Time</th>
                 <th>Collateral tokenId</th>
+                <th>End Time</th>
                 <th>Action</th>
               </tr>
             </thead>
             <tbody>
-              {myActiveLoans.length === 0 ? (
-                <tr><td colSpan="7">No active loans.</td></tr>
-              ) : (
-                myActiveLoans.map((l) => (
-                  <tr key={l.loanId}>
-                    <td>{l.loanId}</td>
-                    <td>{l.lender}</td>
-                    <td>{l.loanAmount}</td>
-                    <td>{l.interestRate}%</td>
-                    <td>{new Date(l.endTime * 1000).toLocaleString()}</td>
-                    <td>{renderTokenLabel(l.collateralTokenId)}</td>
-                    <td>
-                      <Button size="sm" variant="success" onClick={() => repayLoan(l.loanId)}>
-                        Repay
-                      </Button>
-                    </td>
-                  </tr>
-                ))
+              {myActiveLoans.map((l) => (
+                <tr key={l.loanId}>
+                  <td>{l.loanId}</td>
+                  <td>{l.loanAmount}</td>
+                  <td>{l.interestRate}%</td>
+                  <td>{l.collateralTokenId ? tokenDisplayName(chainId, NFT_ADDRESS, l.collateralTokenId) : "N/A"}</td>
+                  <td>{new Date(l.endTime * 1000).toLocaleString()}</td>
+                  <td>
+                    {l.isExpired ? (
+                      <Badge bg="danger">EXPIRED</Badge>
+                    ) : (
+                      <Button size="sm" onClick={() => repayLoan(l.loanId)}>Repay</Button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+              {myActiveLoans.length === 0 && (
+                <tr><td colSpan={6} className="text-center">No active loans</td></tr>
               )}
             </tbody>
           </Table>
@@ -643,14 +601,14 @@ const Borrower = () => {
       <Toast
         show={toast.show}
         onClose={() => setToast((p) => ({ ...p, show: false }))}
-        delay={3500}
+        delay={3000}
         autohide
-        style={{ position: "fixed", top: 20, right: 20, minWidth: 260 }}
+        style={{ position: "fixed", top: 20, right: 20, minWidth: 320, zIndex: 9999 }}
       >
         <Toast.Header closeButton={true}>
           <strong className="me-auto">Notification</strong>
         </Toast.Header>
-        <Toast.Body style={{ color: toast.variant === "danger" ? "crimson" : "inherit" }}>
+        <Toast.Body className={toast.variant === "danger" ? "text-danger" : ""}>
           {toast.message}
         </Toast.Body>
       </Toast>
