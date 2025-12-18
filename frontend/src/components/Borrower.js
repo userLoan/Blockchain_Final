@@ -18,6 +18,11 @@ const STATUS = {
   EXPIRED: 4,
 };
 
+const toNum = (v) => {
+  const n = Number((v ?? "").toString().trim());
+  return Number.isFinite(n) ? n : 0;
+};
+
 function extractRevertReason(err) {
   const data = err?.error?.data || err?.data || err?.error?.error?.data;
   const msg = err?.error?.message || err?.message || "";
@@ -81,6 +86,12 @@ const Borrower = () => {
     duration: "",
     tokenId: "",
   });
+
+  const amountEth = toNum(formData.amount);
+  const ratePct = toNum(formData.interestRate);
+
+  const interestEth = amountEth * (ratePct / 100);
+  const totalRepayEth = amountEth + interestEth;
 
   const [toast, setToast] = useState({ show: false, message: "", variant: "success" });
   const showToast = (message, variant = "success") => setToast({ show: true, message, variant });
@@ -397,6 +408,12 @@ const Borrower = () => {
                 />
                 <div className="text-muted mt-1" style={{ fontSize: 13 }}>
                   Maximum interest rate allowed is {7}%
+                </div>
+                <div div className="text-muted mt-1" style={{ fontSize: 13 }}>
+                  Interest: {interestEth > 0 ? interestEth.toFixed(6) : "0"} ETH
+                </div>
+                <div div className="text-muted mt-1" style={{ fontSize: 13 }}>
+                  Total to repay: {totalRepayEth > 0 ? totalRepayEth.toFixed(6) : "0"} ETH
                 </div>
               </Col>
             </Form.Group>
