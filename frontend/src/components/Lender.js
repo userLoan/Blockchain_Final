@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Container, Table, Button, Card, Badge, Toast } from "react-bootstrap";
+import { Container, Button, Table, Card, Badge, Toast } from "react-bootstrap";
 import { ethers } from "ethers";
 
 import LendingPlatformABI from "../contracts/LendingPlatform.abi.json";
 import TokenNFTABI from "../contracts/TokenNFT.abi.json";
 import addresses from "../contracts/contract-address.json";
 
+// Support both deploy output styles
 const LENDING_ADDRESS = addresses.LendingPlatform || addresses.lendingPlatformAddress;
 const NFT_ADDRESS = addresses.TokenNFT || addresses.tokenNftAddress;
 
@@ -18,9 +19,12 @@ const STATUS = {
 };
 
 function extractRevertReason(err) {
+  const data = err?.error?.data || err?.data || err?.error?.error?.data;
   const msg = err?.error?.message || err?.message || "";
+
   const m1 = msg.match(/reverted(?: with reason string)?(?::| )['"]?([^'"]+)['"]?/i);
   if (m1?.[1]) return m1[1];
+
   try {
     const body = err?.error?.body;
     if (typeof body === "string") {
@@ -29,17 +33,27 @@ function extractRevertReason(err) {
       if (m2?.[1]) return m2[1];
     }
   } catch (_) {}
+
+  if (data && typeof data === "string" && data.startsWith("0x08c379a0")) {
+    try {
+      const reason = ethers.utils.defaultAbiCoder.decode(["string"], "0x" + data.slice(10))[0];
+      if (reason) return reason;
+    } catch (_) {}
+  }
+
   return msg || "Transaction failed";
 }
 
 async function getOwnedTokenIds(nft, owner) {
   const owned = [];
   let nextId = 1;
+
   try {
     nextId = (await nft.nextTokenId()).toNumber();
   } catch (_) {
     nextId = 1;
   }
+
   for (let id = 1; id < nextId; id++) {
     try {
       const o = await nft.ownerOf(id);
@@ -52,7 +66,6 @@ async function getOwnedTokenIds(nft, owner) {
 const Lender = () => {
   const [account, setAccount] = useState("");
   const [ethBalance, setEthBalance] = useState("");
-
   const [nftCount, setNftCount] = useState(0);
   const [ownedTokenIds, setOwnedTokenIds] = useState([]);
 
@@ -61,6 +74,8 @@ const Lender = () => {
 
   const [requests, setRequests] = useState([]);
   const [activeLoans, setActiveLoans] = useState([]);
+
+  const [autoExpireBusy, setAutoExpireBusy] = useState(false);
 
   const [toast, setToast] = useState({ show: false, message: "", variant: "success" });
   const showToast = (message, variant = "success") => setToast({ show: true, message, variant });
@@ -73,6 +88,15 @@ const Lender = () => {
   useEffect(() => {
     const init = async () => {
       if (!provider) return;
+
+      const accs = await provider.listAccounts();
+      if (!accs || accs.length === 0) {
+        try {
+          await provider.send("eth_requestAccounts", []);
+        } catch (_) {
+          return;
+        }
+      }
 
       const accounts = await provider.listAccounts();
       if (!accounts || accounts.length === 0) return;
@@ -91,12 +115,17 @@ const Lender = () => {
 
   const nowTs = async () => {
     if (!provider) return Math.floor(Date.now() / 1000);
-    const b = await provider.getBlock("latest");
-    return Number(b.timestamp);
+    try {
+      const b = await provider.getBlock("latest");
+      return Number(b.timestamp);
+    } catch {
+      return Math.floor(Date.now() / 1000);
+    }
   };
 
   const updateBalances = async () => {
     if (!provider || !nftContract || !account) return;
+
     const bal = await provider.getBalance(account);
     setEthBalance(ethers.utils.formatEther(bal));
 
@@ -107,8 +136,10 @@ const Lender = () => {
     setOwnedTokenIds(ids);
   };
 
-  const loadAll = async () => {
+  const loadAll = async (skipAuto = false) => {
     if (!lendingContract) return;
+
+    const chainNow = await nowTs();
 
     // Active loans
     const allActive = await lendingContract.getAllActive();
@@ -119,20 +150,21 @@ const Lender = () => {
       loanId: loanIds[i].toNumber(),
       borrower: l.borrower,
       lender: l.lender,
+      loanAmountWei: l.loanAmount,
       loanAmount: ethers.utils.formatEther(l.loanAmount),
       endTime: l.endTime.toNumber(),
       interestRate: l.interestRate.toNumber(),
       collateralTokenId: l.collateralTokenId.toNumber(),
+      isExpired: chainNow > l.endTime.toNumber(),
     }));
     setActiveLoans(mappedLoans);
 
-    // All requests (so we can display EXPIRED / FUNDED / CANCELLED)
+    // All requests (for lender)
     const allReq = await lendingContract.getAllRequests();
     const requestIds = allReq[0];
     const reqs = allReq[1];
 
     const expiry = await lendingContract.REQUEST_EXPIRY();
-    const now = await nowTs();
 
     const createdArr = await Promise.all(requestIds.map((id) => lendingContract.requestCreatedAt(id)));
     const statusArr = await Promise.all(requestIds.map((id) => lendingContract.requestStatus(id)));
@@ -143,14 +175,14 @@ const Lender = () => {
       const statusCode = Number(statusArr[i]);
       const expiresAt = createdAt > 0 ? createdAt + Number(expiry) : 0;
 
-      const expiredByTime = statusCode === STATUS.ACTIVE && createdAt > 0 && now > expiresAt;
+      const expiredByTime = statusCode === STATUS.ACTIVE && createdAt > 0 && chainNow > expiresAt;
 
       return {
         requestId,
         borrower: r.borrower,
         loanAmountWei: r.loanAmount,
         loanAmount: ethers.utils.formatEther(r.loanAmount),
-        duration: r.durationInDays ? r.durationInDays.toNumber() : r.duration.toNumber(),
+        duration: r.durationInDays ? r.durationInDays.toNumber() : r.duration?.toNumber?.() ?? 0,
         interestRate: r.interestRate.toNumber(),
         collateralTokenId: r.collateralTokenId.toNumber(),
         isActive: r.isActive,
@@ -161,9 +193,31 @@ const Lender = () => {
       };
     });
 
-    // sort: active first, then expired, then others
+    // Sort: pending first
     mappedReqs.sort((a, b) => (b.statusCode === STATUS.ACTIVE) - (a.statusCode === STATUS.ACTIVE));
     setRequests(mappedReqs);
+
+    // Auto-expire (finalize return) for any expired ACTIVE requests
+    if (!skipAuto && !autoExpireBusy) {
+      const target = mappedReqs.find((x) => x.isActive && x.statusCode === STATUS.ACTIVE && x.expiredByTime);
+      if (target) {
+        setAutoExpireBusy(true);
+        try {
+          const tx = await lendingContract.expireLoanRequest(target.requestId);
+          await tx.wait();
+          showToast(`Request #${target.requestId} expired. NFT returned to borrower.`, "success");
+        } catch (e) {
+          console.error(e);
+          showToast(extractRevertReason(e), "danger");
+        } finally {
+          setAutoExpireBusy(false);
+        }
+
+        await updateBalances();
+        await loadAll(true);
+        return;
+      }
+    }
   };
 
   useEffect(() => {
@@ -218,7 +272,10 @@ const Lender = () => {
   };
 
   const renderReqStatus = (r) => {
-    if (r.statusCode === STATUS.ACTIVE && r.expiredByTime) return <Badge bg="warning" text="dark">EXPIRED</Badge>;
+    // Lender requirement: nếu quá 2 ngày chưa fund => EXPIRED
+    if (r.statusCode === STATUS.ACTIVE && r.expiredByTime) {
+      return <Badge bg="warning" text="dark">EXPIRED</Badge>;
+    }
     if (r.statusCode === STATUS.ACTIVE) return <Badge bg="success">PENDING</Badge>;
     if (r.statusCode === STATUS.EXPIRED) return <Badge bg="warning" text="dark">EXPIRED</Badge>;
     if (r.statusCode === STATUS.FUNDED) return <Badge bg="info">FUNDED</Badge>;
@@ -228,8 +285,14 @@ const Lender = () => {
 
   const renderReqAction = (r) => {
     if (r.statusCode === STATUS.ACTIVE && r.expiredByTime) {
+      // UI will auto-trigger; keep a manual fallback button
       return (
-        <Button variant="outline-warning" size="sm" onClick={() => expireRequest(r.requestId)}>
+        <Button
+          variant="outline-warning"
+          size="sm"
+          disabled={autoExpireBusy}
+          onClick={() => expireRequest(r.requestId)}
+        >
           Return Collateral
         </Button>
       );
@@ -255,18 +318,19 @@ const Lender = () => {
       </Card>
 
       <Card className="mb-4">
-        <Card.Header className="d-flex justify-content-between align-items-center">
-          <strong>Loan Requests</strong>
-          <Button onClick={loadAll}>Refresh</Button>
-        </Card.Header>
+        <Card.Header><strong>All Loan Requests</strong></Card.Header>
         <Card.Body>
-          <Table bordered hover responsive>
+          <Button variant="outline-primary" size="sm" className="mb-2" onClick={loadAll}>
+            Refresh
+          </Button>
+
+          <Table bordered hover>
             <thead>
               <tr>
                 <th>Request ID</th>
                 <th>Borrower</th>
                 <th>Amount (ETH)</th>
-                <th>Duration</th>
+                <th>Duration (days)</th>
                 <th>Interest</th>
                 <th>Collateral tokenId</th>
                 <th>Status</th>
@@ -274,51 +338,69 @@ const Lender = () => {
               </tr>
             </thead>
             <tbody>
-              {requests.map((r) => (
-                <tr key={r.requestId}>
-                  <td>{r.requestId}</td>
-                  <td>{r.borrower}</td>
-                  <td>{r.loanAmount}</td>
-                  <td>{r.duration} days</td>
-                  <td>{r.interestRate}%</td>
-                  <td>{r.collateralTokenId}</td>
-                  <td>{renderReqStatus(r)}</td>
-                  <td>{renderReqAction(r)}</td>
-                </tr>
-              ))}
-              {requests.length === 0 && (
-                <tr><td colSpan={8} className="text-center">No requests</td></tr>
+              {requests.length === 0 ? (
+                <tr><td colSpan="8">No requests found.</td></tr>
+              ) : (
+                requests.map((r) => (
+                  <tr key={r.requestId}>
+                    <td>{r.requestId}</td>
+                    <td>{r.borrower}</td>
+                    <td>{r.loanAmount}</td>
+                    <td>{r.duration}</td>
+                    <td>{r.interestRate}%</td>
+                    <td>{r.collateralTokenId}</td>
+                    <td>{renderReqStatus(r)}</td>
+                    <td>{renderReqAction(r)}</td>
+                  </tr>
+                ))
               )}
             </tbody>
           </Table>
         </Card.Body>
       </Card>
 
-      <Card>
-        <Card.Header className="d-flex justify-content-between align-items-center">
-          <strong>Active Loans</strong>
-          <Button onClick={loadAll}>Refresh</Button>
-        </Card.Header>
+      <Card className="mb-4">
+        <Card.Header><strong>Active Loans</strong></Card.Header>
         <Card.Body>
-          <Table bordered hover responsive>
+          <Button variant="outline-primary" size="sm" className="mb-2" onClick={loadAll}>
+            Refresh
+          </Button>
+
+          <Table bordered hover>
             <thead>
               <tr>
                 <th>Loan ID</th>
                 <th>Borrower</th>
-                <th>Lender</th>
                 <th>Amount (ETH)</th>
                 <th>Interest</th>
-                <th>Collateral tokenId</th>
                 <th>End Time</th>
+                <th>Collateral tokenId</th>
                 <th>Action</th>
               </tr>
             </thead>
             <tbody>
-              {activeLoans.map((l) => (
-                <LoanRow key={l.loanId} loan={l} onLiquidate={liquidate} nowTs={nowTs} />
-              ))}
-              {activeLoans.length === 0 && (
-                <tr><td colSpan={8} className="text-center">No active loans</td></tr>
+              {activeLoans.length === 0 ? (
+                <tr><td colSpan="7">No active loans.</td></tr>
+              ) : (
+                activeLoans.map((l) => (
+                  <tr key={l.loanId}>
+                    <td>{l.loanId}</td>
+                    <td>{l.borrower}</td>
+                    <td>{l.loanAmount}</td>
+                    <td>{l.interestRate}%</td>
+                    <td>{new Date(l.endTime * 1000).toLocaleString()}</td>
+                    <td>{l.collateralTokenId}</td>
+                    <td>
+                      {l.isExpired ? (
+                        <Button size="sm" variant="danger" onClick={() => liquidate(l.loanId)}>
+                          Liquidate
+                        </Button>
+                      ) : (
+                        "-"
+                      )}
+                    </td>
+                  </tr>
+                ))
               )}
             </tbody>
           </Table>
@@ -330,50 +412,17 @@ const Lender = () => {
         onClose={() => setToast((p) => ({ ...p, show: false }))}
         delay={3500}
         autohide
-        style={{ position: "fixed", top: 20, right: 20, minWidth: 320, zIndex: 9999 }}
+        style={{ position: "fixed", top: 20, right: 20, minWidth: 260 }}
       >
         <Toast.Header closeButton={true}>
           <strong className="me-auto">Notification</strong>
         </Toast.Header>
-        <Toast.Body className={toast.variant === "danger" ? "text-danger" : ""}>
+        <Toast.Body style={{ color: toast.variant === "danger" ? "crimson" : "inherit" }}>
           {toast.message}
         </Toast.Body>
       </Toast>
     </Container>
   );
 };
-
-function LoanRow({ loan, onLiquidate, nowTs }) {
-  const [expired, setExpired] = useState(false);
-
-  useEffect(() => {
-    (async () => {
-      const t = await nowTs();
-      setExpired(t > loan.endTime);
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loan.endTime]);
-
-  return (
-    <tr>
-      <td>{loan.loanId}</td>
-      <td>{loan.borrower}</td>
-      <td>{loan.lender}</td>
-      <td>{loan.loanAmount}</td>
-      <td>{loan.interestRate}%</td>
-      <td>{loan.collateralTokenId}</td>
-      <td>{new Date(loan.endTime * 1000).toLocaleString()}</td>
-      <td>
-        {expired ? (
-          <Button variant="danger" size="sm" onClick={() => onLiquidate(loan.loanId)}>
-            Liquidate
-          </Button>
-        ) : (
-          <Badge bg="info">Running</Badge>
-        )}
-      </td>
-    </tr>
-  );
-}
 
 export default Lender;
