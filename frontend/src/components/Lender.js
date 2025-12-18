@@ -1,4 +1,3 @@
-// frontend/src/components/Lender.js
 import React, { useEffect, useMemo, useState } from "react";
 import { Container, Table, Button, Card, Badge, Toast } from "react-bootstrap";
 import { ethers } from "ethers";
@@ -9,6 +8,14 @@ import addresses from "../contracts/contract-address.json";
 
 const LENDING_ADDRESS = addresses.LendingPlatform || addresses.lendingPlatformAddress;
 const NFT_ADDRESS = addresses.TokenNFT || addresses.tokenNftAddress;
+
+const STATUS = {
+  NONE: 0,
+  ACTIVE: 1,
+  FUNDED: 2,
+  CANCELLED: 3,
+  EXPIRED: 4,
+};
 
 function extractRevertReason(err) {
   const msg = err?.error?.message || err?.message || "";
@@ -74,7 +81,6 @@ const Lender = () => {
       setAccount(addr);
 
       const signer = provider.getSigner();
-
       setLendingContract(new ethers.Contract(LENDING_ADDRESS, LendingPlatformABI, signer));
       setNftContract(new ethers.Contract(NFT_ADDRESS, TokenNFTABI, signer));
     };
@@ -82,6 +88,12 @@ const Lender = () => {
     init();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider]);
+
+  const nowTs = async () => {
+    if (!provider) return Math.floor(Date.now() / 1000);
+    const b = await provider.getBlock("latest");
+    return Number(b.timestamp);
+  };
 
   const updateBalances = async () => {
     if (!provider || !nftContract || !account) return;
@@ -98,22 +110,10 @@ const Lender = () => {
   const loadAll = async () => {
     if (!lendingContract) return;
 
-    const all = await lendingContract.getAllActive();
-    const loanIds = all[0];
-    const loans = all[1];
-    const requestIds = all[2];
-    const reqs = all[3];
-
-    const mappedReqs = reqs.map((r, i) => ({
-      requestId: requestIds[i].toNumber(),
-      borrower: r.borrower,
-      loanAmountWei: r.loanAmount,
-      loanAmount: ethers.utils.formatEther(r.loanAmount),
-      duration: r.duration.toNumber(),
-      interestRate: r.interestRate.toNumber(),
-      collateralTokenId: r.collateralTokenId.toNumber(),
-      isActive: r.isActive,
-    }));
+    // Active loans
+    const allActive = await lendingContract.getAllActive();
+    const loanIds = allActive[0];
+    const loans = allActive[1];
 
     const mappedLoans = loans.map((l, i) => ({
       loanId: loanIds[i].toNumber(),
@@ -124,9 +124,46 @@ const Lender = () => {
       interestRate: l.interestRate.toNumber(),
       collateralTokenId: l.collateralTokenId.toNumber(),
     }));
-
-    setRequests(mappedReqs);
     setActiveLoans(mappedLoans);
+
+    // All requests (so we can display EXPIRED / FUNDED / CANCELLED)
+    const allReq = await lendingContract.getAllRequests();
+    const requestIds = allReq[0];
+    const reqs = allReq[1];
+
+    const expiry = await lendingContract.REQUEST_EXPIRY();
+    const now = await nowTs();
+
+    const createdArr = await Promise.all(requestIds.map((id) => lendingContract.requestCreatedAt(id)));
+    const statusArr = await Promise.all(requestIds.map((id) => lendingContract.requestStatus(id)));
+
+    const mappedReqs = reqs.map((r, i) => {
+      const requestId = requestIds[i].toNumber();
+      const createdAt = Number(createdArr[i]);
+      const statusCode = Number(statusArr[i]);
+      const expiresAt = createdAt > 0 ? createdAt + Number(expiry) : 0;
+
+      const expiredByTime = statusCode === STATUS.ACTIVE && createdAt > 0 && now > expiresAt;
+
+      return {
+        requestId,
+        borrower: r.borrower,
+        loanAmountWei: r.loanAmount,
+        loanAmount: ethers.utils.formatEther(r.loanAmount),
+        duration: r.durationInDays ? r.durationInDays.toNumber() : r.duration.toNumber(),
+        interestRate: r.interestRate.toNumber(),
+        collateralTokenId: r.collateralTokenId.toNumber(),
+        isActive: r.isActive,
+        statusCode,
+        createdAt,
+        expiresAt,
+        expiredByTime,
+      };
+    });
+
+    // sort: active first, then expired, then others
+    mappedReqs.sort((a, b) => (b.statusCode === STATUS.ACTIVE) - (a.statusCode === STATUS.ACTIVE));
+    setRequests(mappedReqs);
   };
 
   useEffect(() => {
@@ -140,12 +177,24 @@ const Lender = () => {
 
   const fund = async (request) => {
     if (!lendingContract) return;
-
     try {
       const tx = await lendingContract.fundLoanRequest(request.requestId, { value: request.loanAmountWei });
       await tx.wait();
-
       showToast("Loan funded successfully", "success");
+      await updateBalances();
+      await loadAll();
+    } catch (e) {
+      console.error(e);
+      showToast(extractRevertReason(e), "danger");
+    }
+  };
+
+  const expireRequest = async (requestId) => {
+    if (!lendingContract) return;
+    try {
+      const tx = await lendingContract.expireLoanRequest(requestId);
+      await tx.wait();
+      showToast("Request expired. NFT returned to borrower.", "success");
       await updateBalances();
       await loadAll();
     } catch (e) {
@@ -168,10 +217,27 @@ const Lender = () => {
     }
   };
 
-  const nowTs = async () => {
-    if (!provider) return Math.floor(Date.now() / 1000);
-    const b = await provider.getBlock("latest");
-    return Number(b.timestamp);
+  const renderReqStatus = (r) => {
+    if (r.statusCode === STATUS.ACTIVE && r.expiredByTime) return <Badge bg="warning" text="dark">EXPIRED</Badge>;
+    if (r.statusCode === STATUS.ACTIVE) return <Badge bg="success">PENDING</Badge>;
+    if (r.statusCode === STATUS.EXPIRED) return <Badge bg="warning" text="dark">EXPIRED</Badge>;
+    if (r.statusCode === STATUS.FUNDED) return <Badge bg="info">FUNDED</Badge>;
+    if (r.statusCode === STATUS.CANCELLED) return <Badge bg="secondary">CANCELLED</Badge>;
+    return <Badge bg="secondary">UNKNOWN</Badge>;
+  };
+
+  const renderReqAction = (r) => {
+    if (r.statusCode === STATUS.ACTIVE && r.expiredByTime) {
+      return (
+        <Button variant="outline-warning" size="sm" onClick={() => expireRequest(r.requestId)}>
+          Return Collateral
+        </Button>
+      );
+    }
+    if (r.statusCode === STATUS.ACTIVE && !r.expiredByTime) {
+      return <Button size="sm" onClick={() => fund(r)}>Fund</Button>;
+    }
+    return "-";
   };
 
   return (
@@ -185,14 +251,12 @@ const Lender = () => {
           <div className="mt-2">
             <strong>Owned tokenIds:</strong> {ownedTokenIds.length ? ownedTokenIds.join(", ") : "None"}
           </div>
-          <div className="mt-3">
-          </div>
         </Card.Body>
       </Card>
 
       <Card className="mb-4">
         <Card.Header className="d-flex justify-content-between align-items-center">
-          <strong>Available Loan Requests</strong>
+          <strong>Loan Requests</strong>
           <Button onClick={loadAll}>Refresh</Button>
         </Card.Header>
         <Card.Body>
@@ -218,20 +282,12 @@ const Lender = () => {
                   <td>{r.duration} days</td>
                   <td>{r.interestRate}%</td>
                   <td>{r.collateralTokenId}</td>
-                  <td>
-                    {r.isActive ? <Badge bg="success">PENDING</Badge> : <Badge bg="secondary">INACTIVE</Badge>}
-                  </td>
-                  <td>
-                    {r.isActive ? (
-                      <Button size="sm" onClick={() => fund(r)}>Fund</Button>
-                    ) : (
-                      "-"
-                    )}
-                  </td>
+                  <td>{renderReqStatus(r)}</td>
+                  <td>{renderReqAction(r)}</td>
                 </tr>
               ))}
               {requests.length === 0 && (
-                <tr><td colSpan={8} className="text-center">No active requests</td></tr>
+                <tr><td colSpan={8} className="text-center">No requests</td></tr>
               )}
             </tbody>
           </Table>
