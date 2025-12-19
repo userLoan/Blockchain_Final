@@ -121,6 +121,18 @@ async function getOwnedTokenIds(nft, owner) {
   return owned;
 }
 
+const toNum = (v, fallback = 0) => {
+  if (v === null || v === undefined) return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+const fmtEth = (n) => {
+  if (!Number.isFinite(n)) return "0";
+  // hiển thị gọn: 0, 1.2, 20, 20.123456
+  return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
+};
+
 const Borrower = () => {
   const [account, setAccount] = useState("");
   const [ethBalance, setEthBalance] = useState("");
@@ -143,6 +155,11 @@ const Borrower = () => {
     duration: "",
     tokenId: "",
   });
+
+  const amountEth = toNum(formData.amount);
+  const ratePct = toNum(formData.interestRate);
+  const interestEth = amountEth > 0 && ratePct > 0 ? (amountEth * ratePct) / 100 : 0;
+  const totalRepayEth = amountEth > 0 ? amountEth + interestEth : 0;
 
   const [toast, setToast] = useState({ show: false, message: "", variant: "success" });
   const showToast = (message, variant = "success") => setToast({ show: true, message, variant });
@@ -408,7 +425,7 @@ const Borrower = () => {
           </div>
           <div className="mt-3">
             <Form.Group className="mb-2">
-              <Form.Label>Custom NFT name (optional)</Form.Label>
+              <Form.Label>NFT name (optional)</Form.Label>
               <Form.Control
                 type="text"
                 placeholder='e.g., "Gold", "House", "Car"'
@@ -449,6 +466,14 @@ const Borrower = () => {
                 <div className="text-muted mt-1" style={{ fontSize: 13 }}>
                   Maximum interest rate allowed is {7}%
                 </div>
+                <div className="text-muted mt-1" style={{ fontSize: 13 }}>
+                  Interest: {fmtEth(interestEth)} ETH
+                </div>
+
+                <div className="text-muted mt-1" style={{ fontSize: 13 }}>
+                  Total to repay: {fmtEth(totalRepayEth)} ETH
+                </div>
+
               </Col>
             </Form.Group>
 
@@ -522,7 +547,7 @@ const Borrower = () => {
                 <th>Amount (ETH)</th>
                 <th>Duration (days)</th>
                 <th>Interest</th>
-                <th>Collateral tokenId</th>
+                <th>Collateral</th>
                 <th>Status</th>
                 <th>Action</th>
               </tr>
@@ -568,7 +593,7 @@ const Borrower = () => {
                 <th>Loan ID</th>
                 <th>Amount (ETH)</th>
                 <th>Interest</th>
-                <th>Collateral tokenId</th>
+                <th>Collateral</th>
                 <th>End Time</th>
                 <th>Action</th>
               </tr>
