@@ -268,7 +268,7 @@ const Lender = () => {
                 <th>Amount (ETH)</th>
                 <th>Duration</th>
                 <th>Interest</th>
-                <th>Collateral tokenId</th>
+                <th>Collateral</th>
                 <th>Status</th>
                 <th>Action</th>
               </tr>
@@ -316,7 +316,7 @@ const Lender = () => {
                 <th>Lender</th>
                 <th>Amount (ETH)</th>
                 <th>Interest</th>
-                <th>Collateral tokenId</th>
+                <th>Collateral</th>
                 <th>End Time</th>
                 <th>Action</th>
               </tr>
